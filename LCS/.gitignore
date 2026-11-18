@@ -1,0 +1,6 @@
+/bin/
+/resultados/full-*/
+/resultados/quick-*/
+__pycache__/
+*.pyc
+*.swp

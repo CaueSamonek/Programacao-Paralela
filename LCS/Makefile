@@ -1,30 +1,31 @@
+CC := gcc
+MPICC := mpicc
+CFLAGS := -std=c11 -O3 -Wall -Wextra -Wpedantic
 
-# arquivos e diretorios
-MAIN_FILE=main.c
-EXEC_NAME=trab
+.PHONY: all test quick experiment calibrate clean
 
-SOURCE_DIR=src/
-HEADER_DIR=includes/
-OBJECT_DIR=objects/
-BINARY_DIR=bin/
+all: bin/lcs_seq bin/lcs_parallel
 
-OBJECTS=
+bin:
+	mkdir -p bin
 
-# compilacao
-CC=gcc
-CFLAGS=-Wall -Wextra --pedantic -g -I $(HEADER_DIR)
-LDFLAGS=-fopenmp
+bin/lcs_seq: src/lcs_sequential.c | bin
+	$(CC) $(CFLAGS) $< -o $@
 
-all: create_dirs $(EXEC_NAME)
+bin/lcs_parallel: src/lcs_parallel.c | bin
+	$(MPICC) $(CFLAGS) -fopenmp $< -o $@
 
-create_dirs:
-	mkdir -p $(OBJECT_DIR) $(BINARY_DIR)
+test: all
+	bash tests/test.sh
 
-$(EXEC_NAME): $(SOURCE_DIR)$(MAIN_FILE) $(addprefix $(OBJECT_DIR), $(OBJECTS))
-	$(CC) $(CFLAGS) $< $(OBJECTS) $(LDFLAGS) -o $(BINARY_DIR)$@
+quick: all
+	python3 -B experiments.py quick
 
-%.o: $(SOURCE_DIR)%.c $(HEADER_DIR)%.h
-	$(CC) $(CFLAGS) -c $< -o $@
+experiment: all
+	python3 -B experiments.py full
 
-purge:
-	rm -fr $(OBJECT_DIR) $(BINARY_DIR)
+calibrate: bin/lcs_seq
+	python3 -B experiments.py calibrate
+
+clean:
+	rm -rf bin
