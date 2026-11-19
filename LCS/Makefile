@@ -25,7 +25,7 @@ experiment: all
 	python3 -B experiments.py full
 
 calibrate: bin/lcs_seq
-	python3 -B experiments.py calibrate
+	python3 -B experiments.py calibrate --no-build
 
 clean:
 	rm -rf bin

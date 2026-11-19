@@ -743,10 +743,10 @@ def analyze_command(args: argparse.Namespace) -> None:
 
 
 def calibration_command(args: argparse.Namespace) -> None:
+    if not args.no_build:
+        subprocess.run(["make", "bin/lcs_seq"], cwd=ROOT, check=True)
     run_dir = make_output_dir(args.output, False)
     run_dir.mkdir(parents=True, exist_ok=False)
-    if not args.no_build:
-        subprocess.run(["make", "seq"], cwd=ROOT, check=True)
     size = calibrate_size(args.target_seconds, args.start_size, run_dir, args.seed)
     print(f"Tamanho recomendado para o teste forte: N={size}")
 
