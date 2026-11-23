@@ -55,7 +55,7 @@ static mtype *allocate_matrix(size_t rows, size_t columns) {
         return NULL;
     }
 
-    // calloc zera a matriz, incluindo a primeira linha e a primeira coluna.
+    // calloc zera a matriz
     return calloc(rows * columns, sizeof(mtype));
 }
 
@@ -71,8 +71,7 @@ static mtype lcs_distributed(mtype *matrix, size_t columns,
     // cada processo calcula um grupo de linhas e as threads dividem os blocos.
     #pragma omp parallel
     {
-        for (size_t tile_diagonal = 0; tile_diagonal < diagonal_count;
-             ++tile_diagonal) {
+        for (size_t tile_diagonal = 0; tile_diagonal < diagonal_count; ++tile_diagonal) {
             #pragma omp master
             {
                 if (rank > 0 && tile_diagonal < column_tile_count) {
@@ -106,8 +105,7 @@ static mtype lcs_distributed(mtype *matrix, size_t columns,
 
             // os blocos da mesma antidiagonal nao dependem entre si.
             #pragma omp for schedule(static)
-            for (size_t row_tile = first_row_tile;
-                 row_tile <= last_row_tile; ++row_tile) {
+            for (size_t row_tile = first_row_tile; row_tile <= last_row_tile; ++row_tile) {
                 size_t column_tile = tile_diagonal - row_tile;
                 size_t first_row = row_tile * TILE_SIZE + 1;
                 size_t last_row = first_row + TILE_SIZE - 1;
@@ -124,13 +122,11 @@ static mtype lcs_distributed(mtype *matrix, size_t columns,
                 // percorre por linhas para preservar as dependencias acima e esquerda.
                 for (size_t row = first_row; row <= last_row; ++row) {
                     size_t global_row = first_global_row + row - 1;
-                    for (size_t column = first_column;
-                         column <= last_column; ++column) {
+                    for (size_t column = first_column; column <= last_column; ++column) {
                         size_t current_index = row * columns + column;
 
                         if (seq_a[column - 1] == seq_b[global_row - 1]) {
-                            matrix[current_index] =
-                                matrix[current_index - columns - 1] + 1;
+                            matrix[current_index] = matrix[current_index - columns - 1] + 1;
                         } else {
                             mtype above = matrix[current_index - columns];
                             mtype left = matrix[current_index - 1];
@@ -143,8 +139,7 @@ static mtype lcs_distributed(mtype *matrix, size_t columns,
             // a barreira implicita do omp for conclui a antidiagonal atual.
             #pragma omp master
             {
-                if (rank + 1 < process_count &&
-                    tile_diagonal + 1 >= row_tile_count) {
+                if (rank + 1 < process_count && tile_diagonal + 1 >= row_tile_count) {
                     size_t column_tile = tile_diagonal + 1 - row_tile_count;
                     if (column_tile < column_tile_count) {
                         size_t first_column = column_tile * TILE_SIZE + 1;
@@ -179,6 +174,7 @@ int main(int argc, char **argv) {
     int world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    double total_start = MPI_Wtime();
 
     if (provided < MPI_THREAD_FUNNELED) {
         if (world_rank == 0) {
@@ -245,8 +241,12 @@ int main(int argc, char **argv) {
 
     MPI_Bcast(seq_a, (int)size_a + 1, MPI_CHAR, 0, MPI_COMM_WORLD);
     MPI_Bcast(seq_b, (int)size_b + 1, MPI_CHAR, 0, MPI_COMM_WORLD);
+    double input_end = MPI_Wtime();
 
     mtype score = 0;
+    double allocation_time = 0.0;
+    double kernel_time = 0.0;
+    double total_time = input_end - total_start;
     int active_count = size_b == 0 ? 1 : world_size;
     if (active_count > (int)size_b && size_b > 0) {
         active_count = (int)size_b;
@@ -270,6 +270,7 @@ int main(int argc, char **argv) {
         first_global_row += (size_t)rank < remainder ? (size_t)rank : remainder;
 
         size_t columns = size_a + 1;
+        double allocation_start = MPI_Wtime();
         mtype *local_matrix = allocate_matrix(local_rows + 1, columns);
         int local_matrix_ok = local_matrix != NULL;
         int all_matrices_ok;
@@ -283,7 +284,9 @@ int main(int argc, char **argv) {
             free(local_matrix);
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
+        allocation_time = MPI_Wtime() - allocation_start;
 
+        double kernel_start = MPI_Wtime();
         mtype local_score = lcs_distributed(
             local_matrix, columns, local_rows, first_global_row, seq_a, seq_b,
             size_a, rank, process_count, active_communicator);
@@ -292,6 +295,8 @@ int main(int argc, char **argv) {
         score = local_score;
         MPI_Bcast(&score, 1, MPI_UNSIGNED_SHORT, process_count - 1,
                   active_communicator);
+        kernel_time = MPI_Wtime() - kernel_start;
+        total_time = MPI_Wtime() - total_start;
 
         free(local_matrix);
     }
@@ -300,8 +305,24 @@ int main(int argc, char **argv) {
         MPI_Comm_free(&active_communicator);
     }
 
+    double local_times[4] = {
+        input_end - total_start,
+        allocation_time,
+        kernel_time,
+        total_time,
+    };
+    double maximum_times[4];
+    MPI_Reduce(local_times, maximum_times, 4, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+
     if (world_rank == 0) {
         printf("%hu\n", score);
+        if (getenv("LCS_TIMING") != NULL) {
+            fprintf(stderr,
+                    "input=%.9f allocation=%.9f kernel=%.9f total=%.9f\n",
+                    maximum_times[0], maximum_times[1], maximum_times[2],
+                    maximum_times[3]);
+        }
     }
 
     free(seq_a);

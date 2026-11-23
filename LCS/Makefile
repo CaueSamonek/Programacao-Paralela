@@ -2,7 +2,7 @@ CC := gcc
 MPICC := mpicc
 CFLAGS := -std=c11 -O3 -Wall -Wextra -Wpedantic
 
-.PHONY: all test quick experiment calibrate clean
+.PHONY: all test quick experiment clean
 
 all: bin/lcs_seq bin/lcs_parallel
 
@@ -23,9 +23,6 @@ quick: all
 
 experiment: all
 	python3 -B experiments.py full
-
-calibrate: bin/lcs_seq
-	python3 -B experiments.py calibrate --no-build
 
 clean:
 	rm -rf bin

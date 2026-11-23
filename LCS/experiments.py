@@ -2,7 +2,7 @@
 """orquestra os experimentos de desempenho do lcs.
 
 o script gera entradas reproduziveis, executa cada configuracao de forma
-intercalada e produz arquivos csv e um relatorio markdown com os calculos.
+intercalada e produz arquivos csv com os calculos.
 """
 
 from __future__ import annotations
@@ -26,11 +26,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULTS = ROOT / "resultados"
+EXPERIMENT_INPUTS = Path("/tmp/lcs-experiment-inputs")
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+TILE_SIZE = 256
 RAW_FIELDS = [
-    "timestamp",
     "phase",
     "program",
+    "strategy",
     "input_size",
     "processes",
     "threads",
@@ -46,6 +48,7 @@ RAW_FIELDS = [
 SUMMARY_FIELDS = [
     "phase",
     "program",
+    "strategy",
     "input_size",
     "processes",
     "threads",
@@ -60,10 +63,26 @@ SUMMARY_FIELDS = [
     "stddev_total_s",
     "cv_total_pct",
     "sequential_mean_total_s",
+    "parallel_time_pct",
+    "time_reduction_pct",
     "speedup",
     "efficiency",
+    "efficiency_pct",
     "weak_efficiency",
+    "weak_efficiency_pct",
     "best_layout",
+]
+STRATEGY_FIELDS = [
+    "input_size",
+    "strategy",
+    "processes",
+    "threads",
+    "workers",
+    "mean_total_s",
+    "stddev_total_s",
+    "speedup",
+    "efficiency_pct",
+    "winner",
 ]
 
 
@@ -79,6 +98,18 @@ class Configuration:
     @property
     def workers(self) -> int:
         return self.processes * self.threads
+
+    @property
+    def strategy(self) -> str:
+        if self.program == "sequential":
+            return "sequential"
+        if self.processes == 1 and self.threads == 1:
+            return "parallel_1_worker"
+        if self.processes == 1:
+            return "openmp"
+        if self.threads == 1:
+            return "mpi"
+        return "openmp_mpi"
 
 
 def run_command(command: list[str], env: dict[str, str] | None = None,
@@ -120,16 +151,48 @@ def detect_topology() -> tuple[int, int]:
     return max(1, len(cores)), logical
 
 
+def cpu_metadata() -> dict[str, str]:
+    wanted = {
+        "Architecture": "cpu_architecture",
+        "Model name": "cpu_model",
+        "Socket(s)": "cpu_sockets",
+        "Core(s) per socket": "cpu_cores_per_socket",
+        "Thread(s) per core": "cpu_threads_per_core",
+        "CPU max MHz": "cpu_max_mhz",
+        "L1d cache": "cpu_l1d_cache",
+        "L1i cache": "cpu_l1i_cache",
+        "L2 cache": "cpu_l2_cache",
+        "L3 cache": "cpu_l3_cache",
+    }
+    values: dict[str, str] = {}
+    for line in command_output(["lscpu"]).splitlines():
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        if name in wanted:
+            values[wanted[name]] = value.strip()
+    return values
+
+
+def memory_metadata() -> dict[str, str]:
+    lines = command_output(["free", "-h"]).splitlines()
+    if len(lines) < 3:
+        return {}
+    return {
+        "memory_total": lines[1].split()[1],
+        "swap_total": lines[2].split()[1],
+    }
+
+
 def collect_metadata() -> dict[str, object]:
     physical, logical = detect_topology()
     return {
         "collected_at": datetime.now().astimezone().isoformat(),
-        "hostname": command_output(["hostname"]),
         "operating_system": command_output(["uname", "-srvmo"]),
-        "cpu": command_output(["lscpu"]),
+        **cpu_metadata(),
         "physical_cores": physical,
         "logical_cpus": logical,
-        "memory": command_output(["free", "-h"]),
+        **memory_metadata(),
         "gcc": command_output(["gcc", "--version"]).splitlines()[0],
         "mpicc": command_output(["mpicc", "--version"]).splitlines()[0],
         "mpirun": command_output(["mpirun", "--version"]).splitlines()[0],
@@ -139,8 +202,6 @@ def collect_metadata() -> dict[str, object]:
         "intel_turbo_no_turbo": read_optional(
             "/sys/devices/system/cpu/intel_pstate/no_turbo"
         ),
-        "git_commit": command_output(["git", "rev-parse", "HEAD"]),
-        "git_status": command_output(["git", "status", "--short"]),
         "compiler_flags": "-std=c11 -Wall -Wextra -Wpedantic -O3 -fopenmp",
         "omp_dynamic": "false",
         "omp_proc_bind": "close",
@@ -159,8 +220,8 @@ def write_sequence(path: Path, length: int, seed: int) -> None:
         output.write("\n")
 
 
-def input_paths(run_dir: Path, size: int, seed: int) -> tuple[Path, Path]:
-    directory = run_dir / "inputs" / str(size)
+def input_paths(size: int, seed: int) -> tuple[Path, Path]:
+    directory = EXPERIMENT_INPUTS / str(seed) / str(size)
     file_a = directory / "fileA.in"
     file_b = directory / "fileB.in"
     if not file_a.exists():
@@ -186,11 +247,11 @@ def parse_program_output(
     return values
 
 
-def execute_once(config: Configuration, run_dir: Path, seed: int) -> dict[str, float | int]:
-    file_a, file_b = input_paths(run_dir, config.input_size, seed)
+def execute_once(config: Configuration, seed: int) -> dict[str, float | int]:
+    file_a, file_b = input_paths(config.input_size, seed)
     env = os.environ.copy()
+    env["LCS_TIMING"] = "1"
     if config.program == "sequential":
-        env["LCS_TIMING"] = "1"
         command = [str(ROOT / "bin" / "lcs_seq")]
     else:
         env["OMP_NUM_THREADS"] = str(config.threads)
@@ -255,7 +316,7 @@ def run_batch(configurations: list[Configuration], repetitions: int,
                 flush=True,
             )
             for _ in range(warmups):
-                execute_once(config, run_dir, seed)
+                execute_once(config, seed)
     else:
         print("Aquecimentos desabilitados para esta campanha.", flush=True)
 
@@ -270,13 +331,13 @@ def run_batch(configurations: list[Configuration], repetitions: int,
                 f"{config.processes}x{config.threads}",
                 flush=True,
             )
-            measured = execute_once(config, run_dir, seed)
+            measured = execute_once(config, seed)
             append_csv(
                 raw_path,
                 RAW_FIELDS,
                 {
-                    "timestamp": datetime.now().astimezone().isoformat(),
                     **asdict(config),
+                    "strategy": config.strategy,
                     "workers": config.workers,
                     "repetition": repetition,
                     "score": measured["score"],
@@ -341,12 +402,16 @@ def summarize(raw_path: Path, run_dir: Path, worker_counts: list[int]) -> list[d
         base = baseline[size]
         speedup = float(base["total"]) / total_mean
         efficiency = speedup / workers
+        parallel_time_pct = 100.0 * total_mean / float(base["total"])
         scores = {int(row["score"]) for row in rows}
         correct = len(scores) == 1 and next(iter(scores)) == int(base["score"])
         preliminary.append(
             {
                 "phase": phase,
                 "program": program,
+                "strategy": Configuration(
+                    phase, program, size, processes, threads, tile
+                ).strategy,
                 "input_size": size,
                 "processes": processes,
                 "threads": threads,
@@ -361,9 +426,13 @@ def summarize(raw_path: Path, run_dir: Path, worker_counts: list[int]) -> list[d
                 "stddev_total_s": stddev(totals),
                 "cv_total_pct": 100.0 * stddev(totals) / total_mean,
                 "sequential_mean_total_s": float(base["total"]),
+                "parallel_time_pct": parallel_time_pct,
+                "time_reduction_pct": 100.0 - parallel_time_pct,
                 "speedup": speedup,
                 "efficiency": efficiency,
+                "efficiency_pct": 100.0 * efficiency,
                 "weak_efficiency": "",
+                "weak_efficiency_pct": "",
                 "best_layout": "nao",
             }
         )
@@ -391,163 +460,66 @@ def summarize(raw_path: Path, run_dir: Path, worker_counts: list[int]) -> list[d
         weak_reference = float(weak_one["mean_total_s"])
         for row in preliminary:
             if row["phase"] == "weak" and row["program"] == "parallel":
-                row["weak_efficiency"] = weak_reference / float(row["mean_total_s"])
+                weak_efficiency = weak_reference / float(row["mean_total_s"])
+                row["weak_efficiency"] = weak_efficiency
+                row["weak_efficiency_pct"] = 100.0 * weak_efficiency
 
     summary_path = run_dir / "summary.csv"
     initialize_csv(summary_path, SUMMARY_FIELDS)
     for row in preliminary:
         append_csv(summary_path, SUMMARY_FIELDS, row)
 
+    strategy_path = run_dir / "strategies.csv"
+    initialize_csv(strategy_path, STRATEGY_FIELDS)
+    for row in preliminary:
+        if row["phase"] == "layout" and row["program"] == "parallel":
+            append_csv(strategy_path, STRATEGY_FIELDS, {
+                **row,
+                "winner": row["best_layout"],
+            })
+
     write_amdahl(run_dir, baseline, worker_counts)
-    write_report(run_dir, preliminary, baseline, best_layout)
     return preliminary
 
 
 def write_amdahl(run_dir: Path, baseline: dict[int, dict[str, float | int]],
                   worker_counts: list[int]) -> None:
-    fields = ["input_size", "serial_fraction", "parallel_fraction", "workers", "max_speedup"]
+    fields = [
+        "input_size",
+        "non_parallel_time_s",
+        "non_parallel_percentage",
+        "parallelizable_time_s",
+        "parallelizable_percentage",
+        "workers",
+        "max_speedup",
+    ]
     path = run_dir / "amdahl.csv"
     initialize_csv(path, fields)
     for size, values in sorted(baseline.items()):
-        serial = (float(values["input"]) + float(values["allocation"])) / float(values["total"])
+        non_parallel_time = float(values["input"]) + float(values["allocation"])
+        parallelizable_time = float(values["kernel"])
+        serial = non_parallel_time / float(values["total"])
         parallel = 1.0 - serial
         for workers in worker_counts:
             speedup = 1.0 / (serial + parallel / workers)
             append_csv(path, fields, {
                 "input_size": size,
-                "serial_fraction": serial,
-                "parallel_fraction": parallel,
+                "non_parallel_time_s": non_parallel_time,
+                "non_parallel_percentage": 100.0 * serial,
+                "parallelizable_time_s": parallelizable_time,
+                "parallelizable_percentage": 100.0 * parallel,
                 "workers": workers,
                 "max_speedup": speedup,
             })
         append_csv(path, fields, {
             "input_size": size,
-            "serial_fraction": serial,
-            "parallel_fraction": parallel,
+            "non_parallel_time_s": non_parallel_time,
+            "non_parallel_percentage": 100.0 * serial,
+            "parallelizable_time_s": parallelizable_time,
+            "parallelizable_percentage": 100.0 * parallel,
             "workers": "infinito",
             "max_speedup": 1.0 / serial if serial > 0 else "infinito",
         })
-
-
-def markdown_table(headers: list[str], rows: list[list[object]]) -> str:
-    def text(value: object) -> str:
-        if isinstance(value, float):
-            return f"{value:.4f}"
-        return str(value)
-
-    lines = [
-        "| " + " | ".join(headers) + " |",
-        "| " + " | ".join("---" for _ in headers) + " |",
-    ]
-    lines.extend("| " + " | ".join(text(value) for value in row) + " |" for row in rows)
-    return "\n".join(lines)
-
-
-def write_report(run_dir: Path, summary: list[dict[str, object]],
-                 baseline: dict[int, dict[str, float | int]],
-                 best_layout: dict[int, dict[str, object]]) -> None:
-    strong_rows = [best_layout[key] for key in sorted(best_layout)]
-    size_rows = [
-        row for row in summary
-        if row["program"] == "parallel" and (
-            row["phase"] == "size"
-            or (row["phase"] == "layout" and row["best_layout"] == "sim")
-        )
-    ]
-    weak_rows = [
-        row for row in summary
-        if row["phase"] == "weak" and row["program"] == "parallel"
-    ]
-    correctness = all(row["correct"] == "sim" for row in summary)
-
-    lines = [
-        "# Resultados dos experimentos LCS",
-        "",
-        f"Corretude de todas as execucoes: **{'sim' if correctness else 'nao'}**.",
-        "",
-        "## Escalabilidade forte",
-        "",
-        markdown_table(
-            ["N", "Processos", "Threads", "Workers", "Tempo (s)", "Desvio", "Speedup", "Eficiencia"],
-            [[
-                row["input_size"], row["processes"], row["threads"], row["workers"],
-                row["mean_total_s"], row["stddev_total_s"], row["speedup"], row["efficiency"],
-            ] for row in strong_rows],
-        ),
-        "",
-        "## Variacao do tamanho da entrada",
-        "",
-        markdown_table(
-            ["N", "Workers", "Processos", "Threads", "Tempo (s)", "Speedup", "Eficiencia"],
-            [[
-                row["input_size"], row["workers"], row["processes"], row["threads"],
-                row["mean_total_s"], row["speedup"], row["efficiency"],
-            ] for row in sorted(size_rows, key=lambda item: (item["input_size"], item["workers"]))],
-        ),
-        "",
-        "## Escalabilidade fraca",
-        "",
-        markdown_table(
-            ["N", "Workers", "Processos", "Threads", "Tempo (s)", "Eficiencia fraca"],
-            [[
-                row["input_size"], row["workers"], row["processes"], row["threads"],
-                row["mean_total_s"], row["weak_efficiency"],
-            ] for row in sorted(weak_rows, key=lambda item: item["workers"])],
-        ),
-        "",
-        "## Fracao sequencial medida",
-        "",
-        markdown_table(
-            ["N", "Fracao sequencial", "Fracao paralelizavel"],
-            [[
-                size,
-                (float(values["input"]) + float(values["allocation"])) / float(values["total"]),
-                1.0 - (float(values["input"]) + float(values["allocation"])) / float(values["total"]),
-            ] for size, values in sorted(baseline.items())],
-        ),
-        "",
-        "## Lei de Amdahl",
-        "",
-        markdown_table(
-            ["N", "Workers", "Speedup maximo teorico"],
-            [
-                [
-                    size,
-                    workers,
-                    1.0 / (serial + (1.0 - serial) / workers),
-                ]
-                for size, values in sorted(baseline.items())
-                for serial in [
-                    (float(values["input"]) + float(values["allocation"]))
-                    / float(values["total"])
-                ]
-                for workers in sorted(best_layout)
-            ]
-            + [
-                [
-                    size,
-                    "infinito",
-                    1.0 / serial if serial > 0 else "infinito",
-                ]
-                for size, values in sorted(baseline.items())
-                for serial in [
-                    (float(values["input"]) + float(values["allocation"]))
-                    / float(values["total"])
-                ]
-            ],
-        ),
-        "",
-        "## Formulas",
-        "",
-        "- Speedup: `T_sequencial / T_paralelo`.",
-        "- Eficiencia: `speedup / (processos * threads)`.",
-        "- Desvio padrao: desvio amostral das execucoes medidas.",
-        "- Eficiencia fraca: `T_1(N_base) / T_P(N_base * sqrt(P))`.",
-        "- Amdahl: `1 / (s + (1-s)/P)`.",
-        "",
-        "Os dados completos estao em `raw.csv`, `summary.csv` e `amdahl.csv`.",
-    ]
-    (run_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def powers_of_two(limit: int) -> list[int]:
@@ -592,8 +564,7 @@ def available_memory_bytes() -> int:
     return 512 * 1024 * 1024
 
 
-def calibrate_size(target_seconds: float, start_size: int, run_dir: Path,
-                   seed: int) -> int:
+def calibrate_size(target_seconds: float, start_size: int, seed: int) -> int:
     # cada celula usa dois bytes e o restante fica disponivel para o sistema e o mpi.
     max_size = int(math.sqrt(available_memory_bytes() * 0.60 / 2.0)) - 1
     size = min(start_size, max_size)
@@ -601,8 +572,8 @@ def calibrate_size(target_seconds: float, start_size: int, run_dir: Path,
 
     while True:
         config = Configuration("calibration", "sequential", size)
-        execute_once(config, run_dir, seed)
-        result = execute_once(config, run_dir, seed)
+        execute_once(config, seed)
+        result = execute_once(config, seed)
         kernel = float(result["kernel"])
         print(f"N={size}: kernel={kernel:.3f} s")
         if kernel >= target_seconds or size >= max_size:
@@ -624,11 +595,13 @@ def make_output_dir(name: str | None, quick: bool) -> Path:
         path = Path(name)
         return path if path.is_absolute() else ROOT / path
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return DEFAULT_RESULTS / f"{'quick' if quick else 'full'}-{stamp}"
+    if quick:
+        return Path("/tmp") / f"lcs-quick-{stamp}"
+    return DEFAULT_RESULTS
 
 
 def validate_campaign_arguments(args: argparse.Namespace, quick: bool) -> None:
-    positive = ["max_workers", "strong_size", "tile_size", "repetitions"]
+    positive = ["max_workers", "strong_size", "repetitions"]
     for name in positive:
         value = getattr(args, name, None)
         if value is not None and value <= 0:
@@ -642,7 +615,7 @@ def validate_campaign_arguments(args: argparse.Namespace, quick: bool) -> None:
 def campaign(args: argparse.Namespace, quick: bool) -> Path:
     validate_campaign_arguments(args, quick)
     run_dir = make_output_dir(args.output, quick)
-    run_dir.mkdir(parents=True, exist_ok=False)
+    run_dir.mkdir(parents=True, exist_ok=run_dir == DEFAULT_RESULTS)
     raw_path = run_dir / "raw.csv"
     initialize_csv(raw_path, RAW_FIELDS)
 
@@ -667,7 +640,7 @@ def campaign(args: argparse.Namespace, quick: bool) -> Path:
         repetitions = args.repetitions or 20
         warmups = args.warmups if args.warmups is not None else 3
         strong_size = args.strong_size or calibrate_size(
-            args.target_seconds, args.start_size, run_dir, args.seed
+            args.target_seconds, args.start_size, args.seed
         )
         size_values = sorted({
             max(128, int(strong_size * 0.50)),
@@ -685,7 +658,7 @@ def campaign(args: argparse.Namespace, quick: bool) -> Path:
         "repetitions": repetitions,
         "warmups": warmups,
         "seed": args.seed,
-        "tile_size": args.tile_size,
+        "tile_size": TILE_SIZE,
         "strong_size": strong_size,
         "size_values": size_values,
         "weak_base_size": weak_base,
@@ -701,7 +674,7 @@ def campaign(args: argparse.Namespace, quick: bool) -> Path:
         for processes, threads in layout_options(workers, physical):
             stage_one.append(Configuration(
                 "layout", "parallel", strong_size, processes, threads,
-                args.tile_size,
+                TILE_SIZE,
             ))
     run_batch(stage_one, repetitions, warmups, run_dir, args.seed, raw_path)
 
@@ -713,22 +686,15 @@ def campaign(args: argparse.Namespace, quick: bool) -> Path:
         for workers in worker_counts:
             processes, threads = selected[workers]
             stage_two.append(Configuration(
-                "size", "parallel", size, processes, threads, args.tile_size
+                "size", "parallel", size, processes, threads, TILE_SIZE
             ))
     for workers in worker_counts:
         processes, threads = selected[workers]
         stage_two.append(Configuration(
             "weak", "parallel", weak_sizes[workers], processes, threads,
-            args.tile_size,
+            TILE_SIZE,
         ))
     run_batch(stage_two, repetitions, warmups, run_dir, args.seed, raw_path)
-
-    plan_fields = ["phase", "program", "input_size", "processes", "threads", "workers", "tile_size"]
-    initialize_csv(run_dir / "plan.csv", plan_fields)
-    for config in stage_one + stage_two:
-        append_csv(run_dir / "plan.csv", plan_fields, {
-            **asdict(config), "workers": config.workers
-        })
 
     summarize(raw_path, run_dir, worker_counts)
     print(f"Resultados gravados em {run_dir}")
@@ -739,16 +705,7 @@ def analyze_command(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir).resolve()
     metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
     summarize(run_dir / "raw.csv", run_dir, list(metadata["worker_counts"]))
-    print(f"Relatorios atualizados em {run_dir}")
-
-
-def calibration_command(args: argparse.Namespace) -> None:
-    if not args.no_build:
-        subprocess.run(["make", "bin/lcs_seq"], cwd=ROOT, check=True)
-    run_dir = make_output_dir(args.output, False)
-    run_dir.mkdir(parents=True, exist_ok=False)
-    size = calibrate_size(args.target_seconds, args.start_size, run_dir, args.seed)
-    print(f"Tamanho recomendado para o teste forte: N={size}")
+    print(f"Analises atualizadas em {run_dir}")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -761,7 +718,6 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--warmups", type=int)
         command.add_argument("--max-workers", type=int)
         command.add_argument("--strong-size", type=int)
-        command.add_argument("--tile-size", type=int, default=256)
         command.add_argument("--seed", type=int, default=1316)
         command.add_argument("--no-build", action="store_true")
 
@@ -773,14 +729,7 @@ def parser() -> argparse.ArgumentParser:
     full.add_argument("--target-seconds", type=float, default=10.0)
     full.add_argument("--start-size", type=int, default=2000)
 
-    calibrate = subparsers.add_parser("calibrate", help="encontra N para o teste forte")
-    calibrate.add_argument("--target-seconds", type=float, default=10.0)
-    calibrate.add_argument("--start-size", type=int, default=2000)
-    calibrate.add_argument("--output")
-    calibrate.add_argument("--seed", type=int, default=1316)
-    calibrate.add_argument("--no-build", action="store_true")
-
-    analyze = subparsers.add_parser("analyze", help="refaz os relatorios de um resultado")
+    analyze = subparsers.add_parser("analyze", help="refaz as analises de um resultado")
     analyze.add_argument("run_dir")
     return main
 
@@ -792,8 +741,6 @@ def main() -> int:
             campaign(args, quick=True)
         elif args.command == "full":
             campaign(args, quick=False)
-        elif args.command == "calibrate":
-            calibration_command(args)
         else:
             analyze_command(args)
     except (RuntimeError, OSError, ValueError, subprocess.CalledProcessError) as error:
